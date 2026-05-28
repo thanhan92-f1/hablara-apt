@@ -1,0 +1,246 @@
+# ============================================================================
+# Hablara APT Repository Update Workflow
+# ============================================================================
+# Triggered by repository_dispatch from hablara linux-build.yml / linux-arm64-build.yml.
+# Downloads .deb from GitHub Release, imports into reprepro, deploys via GitHub Pages.
+#
+# Trigger: repository_dispatch (event_type: update-apt-repo)
+# Payload: { version: "v1.2.7", arch: "amd64" | "arm64" | "both" }
+#
+# Secrets:
+#   APT_GPG_PRIVATE_KEY - Armored GPG private key for signing
+#   APT_GPG_PASSPHRASE  - Passphrase for the GPG key (optional)
+#   HABLARA_REPO_TOKEN  - PAT with repo scope for downloading from thanhan92-f1/hablara releases
+#
+# Deploy Strategy:
+#   Uses actions/deploy-pages (artifact-based) instead of git push to gh-pages.
+#   This bypasses GitHub's 100MB file size limit for git objects.
+#   Each deployment rebuilds the repo from scratch (latest version only).
+# ============================================================================
+
+name: Update APT Repository
+
+on:
+  repository_dispatch:
+    types: [update-apt-repo]
+
+  # Allow manual trigger for re-importing a specific version
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.2.7)'
+        required: true
+        type: string
+      arch:
+        description: 'Architecture (amd64 or arm64)'
+        required: true
+        type: choice
+        options:
+          - amd64
+          - arm64
+          - both
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: apt-repo-update
+  cancel-in-progress: false
+
+jobs:
+  update-repo:
+    name: Update APT Repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout main (for conf/)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Determine version and architecture
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+            ARCH="${{ github.event.client_payload.arch }}"
+          else
+            VERSION="${{ inputs.version }}"
+            ARCH="${{ inputs.arch }}"
+          fi
+
+          # Validate version format (prevent injection)
+          if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid version format: $VERSION (expected: vX.Y.Z)"
+            exit 1
+          fi
+
+          if ! echo "$ARCH" | grep -qE '^(amd64|arm64|both)$'; then
+            echo "ERROR: Invalid architecture: $ARCH (expected: amd64, arm64, or both)"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION, Architecture: $ARCH"
+
+      - name: Install reprepro
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Setup reprepro workspace
+        run: |
+          mkdir -p workspace/conf
+          cat > workspace/conf/distributions <<'EOF'
+          Origin: Hablara
+          Label: Hablara
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: Hablara Voice Intelligence Platform - APT Repository
+          SignWith: default
+          EOF
+          sed -i 's/^          //' workspace/conf/distributions
+
+          cat > workspace/conf/options <<'EOF'
+          verbose
+          basedir .
+          EOF
+          sed -i 's/^          //' workspace/conf/options
+
+      - name: Import GPG key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "ERROR: APT_GPG_PRIVATE_KEY secret not configured"
+            exit 1
+          fi
+
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+
+          mkdir -p ~/.gnupg
+          echo "allow-preset-passphrase" >> ~/.gnupg/gpg-agent.conf
+          gpg-connect-agent reloadagent /bye 2>/dev/null || true
+
+          if [ -n "$APT_GPG_PASSPHRASE" ]; then
+            KEY_GRIP=$(gpg --list-secret-keys --with-keygrip 2>/dev/null | grep -A1 "sec" | grep "Keygrip" | awk '{print $3}' | head -1)
+            if [ -n "$KEY_GRIP" ]; then
+              echo "$APT_GPG_PASSPHRASE" | /usr/lib/gnupg/gpg-preset-passphrase --preset "$KEY_GRIP"
+            fi
+          fi
+
+          echo "GPG key imported successfully"
+          gpg --list-secret-keys --keyid-format long
+
+      - name: Download .deb from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.HABLARA_REPO_TOKEN }}
+        run: |
+          VERSION="${{ steps.params.outputs.version }}"
+          ARCH="${{ steps.params.outputs.arch }}"
+
+          mkdir -p incoming
+
+          download_deb() {
+            local arch=$1
+            echo "Downloading .deb for ${arch} from release ${VERSION}..."
+            gh release download "$VERSION" \
+              -R thanhan92-f1/hablara \
+              -p "*_${arch}.deb" \
+              -D incoming/ \
+              || { echo "ERROR: Failed to download .deb for $arch"; exit 1; }
+          }
+
+          if [ "$ARCH" = "both" ]; then
+            download_deb "amd64"
+            download_deb "arm64"
+          else
+            download_deb "$ARCH"
+          fi
+
+          echo "Downloaded .deb files:"
+          ls -lh incoming/
+
+      - name: Import into reprepro
+        working-directory: workspace
+        run: |
+          for deb in ../incoming/*.deb; do
+            if [ -f "$deb" ]; then
+              echo "Importing: $(basename "$deb")"
+              reprepro --basedir . -S sound includedeb stable "$deb" || {
+                echo "Warning: Import failed, attempting replace..."
+                PKG_NAME=$(dpkg-deb --field "$deb" Package)
+                reprepro --basedir . remove stable "$PKG_NAME" 2>/dev/null || true
+                reprepro --basedir . -S sound includedeb stable "$deb"
+              }
+            fi
+          done
+
+          rm -rf ../incoming
+
+          echo "Repository contents:"
+          reprepro --basedir . list stable
+
+      - name: Export GPG public key
+        working-directory: workspace
+        run: |
+          KEY_ID=$(gpg --list-secret-keys --keyid-format long 2>/dev/null \
+            | grep "sec" | head -1 | awk '{print $2}' | cut -d'/' -f2)
+          gpg --armor --export "$KEY_ID" > pubkey.asc
+          gpg --export "$KEY_ID" > pubkey.gpg
+          echo "Public key exported (Key ID: $KEY_ID)"
+
+      - name: Create index page
+        working-directory: workspace
+        run: |
+          {
+            echo '<!DOCTYPE html>'
+            echo '<html><head><title>Hablara APT Repository</title></head><body>'
+            echo '<h1>Hablara APT Repository</h1>'
+            echo '<h2>Quick Setup</h2>'
+            echo '<pre><code>curl -fsSL https://thanhan92-f1.github.io/hablara-apt/pubkey.asc \'
+            echo '  | sudo gpg --dearmor -o /usr/share/keyrings/hablara-archive-keyring.gpg'
+            echo ''
+            echo 'echo "Types: deb'
+            echo 'URIs: https://thanhan92-f1.github.io/hablara-apt'
+            echo 'Suites: stable'
+            echo 'Components: main'
+            echo 'Architectures: amd64 arm64'
+            echo 'Signed-By: /usr/share/keyrings/hablara-archive-keyring.gpg" \'
+            echo '  | sudo tee /etc/apt/sources.list.d/hablara.sources'
+            echo ''
+            echo 'sudo apt update &amp;&amp; sudo apt install hablara'
+            echo '</code></pre>'
+            echo '<p>Or install from <a href="https://github.com/thanhan92-f1/hablara/releases">GitHub Releases</a>.</p>'
+            echo '</body></html>'
+          } > index.html
+
+      - name: Prepare deployment directory
+        run: |
+          mkdir -p deploy
+          # Copy only the files needed for the APT repo (not conf/, db/, .github/)
+          cp -r workspace/dists deploy/
+          cp -r workspace/pool deploy/
+          cp workspace/pubkey.asc deploy/
+          cp workspace/pubkey.gpg deploy/
+          cp workspace/index.html deploy/
+          touch deploy/.nojekyll
+
+          echo "Deployment contents:"
+          find deploy -type f | head -30
+          echo "Total size:"
+          du -sh deploy/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3.0.1
+        with:
+          path: deploy
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4.0.5
