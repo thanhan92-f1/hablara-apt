@@ -1,0 +1,7 @@
+Origin: Hablara
+Label: Hablara
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: Hablara Voice Intelligence Platform - APT Repository
+SignWith: default
